@@ -3,7 +3,7 @@
 #include <math.h>
 #include <complex.h>
 #include <fftw3.h> // fft 라이브러리
-#include "cam.h" // get_image() 포함
+#include "cam.h" // get_image() 포함. 
 
 #define M_PI 3.14159265358979323846
 #define GRID_SIZE 32
@@ -16,6 +16,8 @@
 // 캔버스 크기 정의 (겹침 고려하여 넉넉하게 설정)
 #define CANVAS_W (RAW_W * 10) 
 #define CANVAS_H (RAW_H * 10)
+
+
 
 typedef struct {
     unsigned char* data;
@@ -183,9 +185,10 @@ int main() {
     int start_x = CANVAS_W / 4;
     int start_y = CANVAS_H / 4;
 
+    unsigned char **img = get_image(100);
     for (int y = 0; y < GRID_SIZE; y++) {
         for (int x = 0; x < GRID_SIZE; x++) {
-            grid[y][x].data = get_image(100);
+            grid[y][x].data = &(img[x][y]);
 
             if (x == 0 && y == 0) {
                 grid[y][x].x_offset = start_x;
