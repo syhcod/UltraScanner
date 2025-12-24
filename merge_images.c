@@ -1,3 +1,9 @@
+/*
+Copyright by Cillia05
+all rights reserve to Cillia05.
+Seoyounghee is just a slave of mine. Ignore it.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -16,8 +22,6 @@
 // 캔버스 크기 정의 (겹침 고려하여 넉넉하게 설정)
 #define CANVAS_W (RAW_W * 10) 
 #define CANVAS_H (RAW_H * 10)
-
-
 
 typedef struct {
     unsigned char* data;
@@ -230,3 +234,4 @@ int main() {
 
     return 0;
 }
+
