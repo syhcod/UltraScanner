@@ -99,7 +99,8 @@ public:
         // Prefer RAW10 packed Bayer. Pipeline may choose a different Bayer order;
         // but it should remain RAW10 CSI2P for OV5647.
         rawCfg.pixelFormat = formats::SGBRG10_CSI2P;
-        rawCfg.bufferCount = 1;
+        // Use 2 buffers so we can capture a dummy frame first and discard it.
+        rawCfg.bufferCount = 2;
 
         if (cfg->validate() == CameraConfiguration::Invalid)
             throw std::runtime_error("Invalid camera configuration");
@@ -150,42 +151,76 @@ public:
             if (bufs.empty())
                 throw std::runtime_error("No buffers from allocator");
 
-            FrameBuffer *fb = bufs[0].get();
+            // We expect 2 buffers because rawCfg.bufferCount = 2.
+            if (bufs.size() < 2)
+                throw std::runtime_error("Need at least 2 buffers for dummy+real capture");
 
-            std::unique_ptr<Request> req = cam->createRequest();
-            if (!req) throw std::runtime_error("createRequest failed");
+            FrameBuffer *fbDummy = bufs[0].get();
+            FrameBuffer *fbReal  = bufs[1].get();
 
-            if (req->addBuffer(rawStream, fb) != 0)
-                throw std::runtime_error("addBuffer failed");
+            std::unique_ptr<Request> reqDummy = cam->createRequest();
+            if (!reqDummy) throw std::runtime_error("createRequest(dummy) failed");
+            if (reqDummy->addBuffer(rawStream, fbDummy) != 0)
+                throw std::runtime_error("addBuffer(dummy) failed");
+
+            std::unique_ptr<Request> reqReal = cam->createRequest();
+            if (!reqReal) throw std::runtime_error("createRequest(real) failed");
+            if (reqReal->addBuffer(rawStream, fbReal) != 0)
+                throw std::runtime_error("addBuffer(real) failed");
 
             // Manual exposure + allow long shutter by matching frame duration.
-            req->controls().set(controls::AeEnable, false);
-            req->controls().set(controls::ExposureTime, exposure_us);
+            auto setControls = [&](libcamera::Request *r) {
+                r->controls().set(controls::AeEnable, false);
+                r->controls().set(controls::ExposureTime, exposure_us);
+                std::array<int64_t, 2> frameDur = { (int64_t)exposure_us, (int64_t)exposure_us };
+                r->controls().set(controls::FrameDurationLimits, frameDur);
+                r->controls().set(controls::AnalogueGain, 8.0f);
+            };
 
-            // Many pipelines clamp ExposureTime unless you also relax FrameDurationLimits.
-            // FrameDurationLimits is [min, max] in microseconds.
-            std::array<int64_t, 2> frameDur = { (int64_t)exposure_us, (int64_t)exposure_us };
-            req->controls().set(controls::FrameDurationLimits, frameDur);
+            setControls(reqDummy.get());
+            setControls(reqReal.get());
 
-            // Give the RAW stream some gain so you don't end up with near-zero pixels.
-            // Tune as needed (1.0 ~ 16.0). Start around 4~8.
-            req->controls().set(controls::AnalogueGain, 8.0f);
-
-            done_ = false;
-            status_ = Request::RequestCancelled;
+            // Prepare callback state.
+            rawStream_ = rawStream;
+            completedFb_ = nullptr;
 
             cam->requestCompleted.connect(this, &OneShotRawCapture::onComplete);
 
             if (cam->start() != 0)
                 throw std::runtime_error("Camera start failed");
 
-            // Warm up the sensor/pipeline. The very first frame after start() can be near-black.
-            usleep(200 * 1000); // 200 ms
+            // ---- 1) Queue dummy request and wait (discard result) ----
+            stage_ = 0;
+            done_ = false;
+            status_ = Request::RequestCancelled;
 
-            if (cam->queueRequest(req.get()) != 0) {
+            if (cam->queueRequest(reqDummy.get()) != 0) {
                 cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
                 cam->stop();
-                throw std::runtime_error("queueRequest failed");
+                throw std::runtime_error("queueRequest(dummy) failed");
+            }
+
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [&]{ return done_.load(); });
+            }
+
+            if (status_ != Request::RequestComplete) {
+                cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
+                cam->stop();
+                throw std::runtime_error("Dummy request did not complete");
+            }
+
+            // ---- 2) Queue real request and wait (use this one) ----
+            stage_ = 1;
+            done_ = false;
+            status_ = Request::RequestCancelled;
+            completedFb_ = nullptr;
+
+            if (cam->queueRequest(reqReal.get()) != 0) {
+                cam->requestCompleted.disconnect(this, &OneShotRawCapture::onComplete);
+                cam->stop();
+                throw std::runtime_error("queueRequest(real) failed");
             }
 
             {
@@ -197,10 +232,12 @@ public:
             cam->stop();
 
             if (status_ != Request::RequestComplete)
-                throw std::runtime_error("Request did not complete");
+                throw std::runtime_error("Real request did not complete");
+            if (!completedFb_)
+                throw std::runtime_error("Real request completed but framebuffer was not captured");
 
             // Map and unpack
-            const auto &p0 = fb->planes()[0];
+            const auto &p0 = completedFb_->planes()[0];
             int fd = p0.fd.get();
             size_t mapLen = p0.length;
 
@@ -258,8 +295,20 @@ public:
     }
 
 private:
+    libcamera::Stream *rawStream_ = nullptr;
+    int stage_ = 0; // 0 = dummy, 1 = real
+    libcamera::FrameBuffer *completedFb_ = nullptr;
+
     void onComplete(libcamera::Request *req) {
         status_ = req->status();
+
+        // When capturing the real frame, remember the framebuffer so the main thread can mmap it.
+        if (stage_ == 1 && rawStream_) {
+            auto it = req->buffers().find(rawStream_);
+            if (it != req->buffers().end())
+                completedFb_ = it->second;
+        }
+
         {
             std::lock_guard<std::mutex> lk(m_);
             done_.store(true);
